@@ -1,0 +1,5 @@
+.cover
+coverage.txt
+/dist
+/vendor
+/kube-volume-cleaner

@@ -1,0 +1,27 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-volume-cleaner
+  namespace: kube-system
+  labels:
+    app: kube-volume-cleaner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube-volume-cleaner
+  template:
+    metadata:
+      labels:
+        app: kube-volume-cleaner
+    spec:
+      serviceAccountName: kube-volume-cleaner
+      containers:
+        - name: controller
+          image: mohmann/kube-volume-cleaner:latest
+          args:
+            - --label-selector=kube-volume-cleaner.io/on-delete=cleanup-pvcs
+            - --controller-id=kube-volume-cleaner
+            - --delete-after=24h
+            - --resync-interval=30s

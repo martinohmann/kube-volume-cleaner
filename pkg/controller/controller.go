@@ -52,7 +52,7 @@ func New(client kubernetes.Interface, namespace, selector string, dryRun bool) (
 		return nil, errors.Wrapf(err, "failed to parse label selector")
 	}
 
-	podListWatcher := listwatch.NewPodListWatch(client, namespace, labelSelector)
+	podListWatcher := listwatch.NewPodListWatch(client, namespace, labels.Everything())
 	podInformer := cache.NewSharedIndexInformer(podListWatcher, &corev1.Pod{}, 0, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 	podLister := corev1listers.NewPodLister(podInformer.GetIndexer())
 
@@ -288,19 +288,24 @@ func (c *Controller) handleVolumeClaimUpdate(pvc *corev1.PersistentVolumeClaim) 
 	if pod == nil {
 		// pvc is not mounted anymore. If it has a statefulset label and the
 		// statefulset does not exist anymore, it is safe to delete.
-		klog.V(4).Infof("pvc %s/%s is not mounted to a pod", pvc.Namespace, pvc.Name)
+		klog.V(4).Infof("pvc %s/%s is not mounted to a pod, checking if it should be deleted", pvc.Namespace, pvc.Name)
 
 		setName, exists := getStatefulSetLabel(pvc)
 		if !exists {
 			// do we need to do something here?
-			klog.V(4).Infof("pvc %s/%s does not have label %s, not candidate for deletion", pvc.Namespace, pvc.Name, StatefulSetLabel)
+			klog.V(4).Infof("pvc %s/%s does not have label %s, no candidate for deletion", pvc.Namespace, pvc.Name, StatefulSetLabel)
 			return nil
 		}
 
-		_, err := c.getStatefulSet(pvc.Namespace, setName)
+		set, err := c.getStatefulSet(pvc.Namespace, setName)
 		if err == nil {
-			klog.V(4).Infof("statefulset managing pvc %s/%s still present, not deleting pvc", pvc.Namespace, pvc.Name)
-			return nil
+			if isMatchingSelector(set, c.labelSelector) {
+				klog.V(4).Infof("statefulset %s/%s managing pvc %s/%s still present, not deleting pvc", set.Namespace, set.Name, pvc.Namespace, pvc.Name)
+				return nil
+			}
+
+			klog.V(5).Infof("statefulset %s/%s managing pvc %s/%s does not match label selector %q", set.Namespace, set.Name, pvc.Namespace, pvc.Name, c.labelSelector.String())
+			return c.removeStatefulSetLabel(pvc)
 		}
 
 		if !apierrors.IsNotFound(err) {
@@ -320,31 +325,61 @@ func (c *Controller) handleVolumeClaimUpdate(pvc *corev1.PersistentVolumeClaim) 
 	}
 
 	set, err := c.getStatefulSetForPod(pod)
-	if apierrors.IsNotFound(err) {
-		klog.V(4).Infof("pod %s/%s is not managed by a statefulset, ignoring", pod.Namespace, pod.Name)
-		return nil
-	}
 
-	if err != nil {
+	switch {
+	case err != nil:
 		klog.V(1).Infof("failed to retrieve statefulset for pod %s/%s", pod.Namespace, pod.Name)
 		return err
+	case set == nil:
+		klog.V(4).Infof("pod mounting pvc %s/%s does not belong to statefulset", pvc.Namespace, pvc.Name)
+		return c.removeStatefulSetLabel(pvc)
+	case !isMatchingSelector(set, c.labelSelector):
+		klog.V(5).Infof("statefulset %s/%s controlling pod %s/%s does not match label selector %q", set.Namespace, set.Name, pod.Namespace, pod.Name, c.labelSelector.String())
+		return c.removeStatefulSetLabel(pvc)
 	}
 
-	return c.updateStatefulSetLabelOnVolumeClaim(set, pvc)
+	return c.updateStatefulSetLabel(pvc, set.Name)
 }
 
-func (c *Controller) updateStatefulSetLabelOnVolumeClaim(set *appsv1.StatefulSet, pvc *corev1.PersistentVolumeClaim) error {
-	pvcCopy := pvc.DeepCopy()
-
-	newLabel, oldLabel := updateStatefulSetLabel(pvcCopy, set)
-	if newLabel == oldLabel {
-		klog.V(4).Infof("no label change needed on pvc %s/%s", pvc.Namespace, pvc.Name)
+func (c *Controller) removeStatefulSetLabel(pvc *corev1.PersistentVolumeClaim) error {
+	_, found := getStatefulSetLabel(pvc)
+	if !found {
 		return nil
 	}
 
-	klog.Infof("updating label %q on pvc %s/%s: %q -> %q", StatefulSetLabel, pvc.Namespace, pvc.Name, oldLabel, newLabel)
+	pvcCopy := pvc.DeepCopy()
 
-	_, err := c.client.CoreV1().PersistentVolumeClaims(pvc.Namespace).Update(pvcCopy)
+	delete(pvcCopy.Labels, StatefulSetLabel)
+
+	klog.Infof("removing label %q from pvc %s/%s", StatefulSetLabel, pvc.Namespace, pvc.Name)
+
+	return c.syncVolumeClaimUpdate(pvcCopy)
+}
+
+func (c *Controller) updateStatefulSetLabel(pvc *corev1.PersistentVolumeClaim, newValue string) error {
+	pvcCopy := pvc.DeepCopy()
+
+	oldValue, exists := getStatefulSetLabel(pvcCopy)
+	if !exists && pvcCopy.Labels == nil {
+		pvcCopy.Labels = map[string]string{}
+	}
+
+	pvcCopy.Labels[StatefulSetLabel] = newValue
+	if newValue == oldValue {
+		return nil
+	}
+
+	if oldValue == "" {
+		klog.Infof("adding label %q on pvc %s/%s: %q", StatefulSetLabel, pvc.Namespace, pvc.Name, newValue)
+	} else {
+		klog.Infof("updating label %q on pvc %s/%s: %q -> %q", StatefulSetLabel, pvc.Namespace, pvc.Name, oldValue, newValue)
+	}
+
+	return c.syncVolumeClaimUpdate(pvcCopy)
+}
+
+func (c *Controller) syncVolumeClaimUpdate(pvc *corev1.PersistentVolumeClaim) error {
+	_, err := c.client.CoreV1().PersistentVolumeClaims(pvc.Namespace).Update(pvc)
 
 	return err
 }
@@ -378,11 +413,6 @@ func (c *Controller) syncStatefulSet(key string) error {
 }
 
 func (c *Controller) handleStatefulSetUpdate(set *appsv1.StatefulSet) error {
-	if !c.labelSelector.Matches(labels.Set(set.Labels)) {
-		klog.V(4).Infof("statefulset %s/%s does not match label selector %q, ignoring", set.Namespace, set.Name, c.labelSelector.String())
-		return nil
-	}
-
 	pods, err := c.getPodsForStatefulSet(set)
 	if err != nil {
 		klog.V(1).Infof("failed to retrieve pods for statefulset %s/%s", set.Namespace, set.Name)
@@ -467,6 +497,10 @@ func (c *Controller) getStatefulSetForPod(pod *corev1.Pod) (*appsv1.StatefulSet,
 	}
 
 	set, err := c.setLister.StatefulSets(pod.Namespace).Get(ownerRef.Name)
+	if apierrors.IsNotFound(err) {
+		klog.Errorf("pod %s/%s ownerRef points to statefulset %s/%s but it was not found", pod.Namespace, pod.Name, pod.Namespace, ownerRef.Name)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -507,64 +541,4 @@ func (c *Controller) getVolumeClaimsForStatefulSet(namespace, name string) ([]*c
 	selector := getStatefulSetLabelSelector(name)
 
 	return c.pvcLister.PersistentVolumeClaims(namespace).List(selector)
-}
-
-func podHasVolumeClaim(pod *corev1.Pod, claimName string) bool {
-	for _, volume := range pod.Spec.Volumes {
-		if volume.PersistentVolumeClaim == nil {
-			continue
-		}
-
-		if volume.PersistentVolumeClaim.ClaimName == claimName {
-			return true
-		}
-	}
-
-	return false
-}
-
-func getStatefulSetLabel(pvc *corev1.PersistentVolumeClaim) (string, bool) {
-	if len(pvc.Labels) == 0 {
-		return "", false
-	}
-
-	value, found := pvc.Labels[StatefulSetLabel]
-
-	return value, found
-}
-
-func getStatefulSetLabelSelector(name string) labels.Selector {
-	set := labels.Set(map[string]string{
-		StatefulSetLabel: name,
-	})
-
-	return labels.SelectorFromSet(set)
-}
-
-func updateStatefulSetLabel(pvc *corev1.PersistentVolumeClaim, set *appsv1.StatefulSet) (string, string) {
-	if pvc.Labels == nil {
-		pvc.Labels = map[string]string{}
-	}
-
-	oldLabel, isLabeled := pvc.Labels[StatefulSetLabel]
-
-	if set == nil && isLabeled {
-		delete(pvc.Labels, StatefulSetLabel)
-		return "", oldLabel
-	}
-
-	if set != nil && (!isLabeled || oldLabel != set.Name) {
-		pvc.Labels[StatefulSetLabel] = set.Name
-		return set.Name, oldLabel
-	}
-
-	return oldLabel, oldLabel
-}
-
-func isStatefulSetOwnerRef(ownerRef *metav1.OwnerReference) bool {
-	if ownerRef == nil {
-		return false
-	}
-
-	return ownerRef.Kind == "StatefulSet" && ownerRef.APIVersion == "apps/v1"
 }

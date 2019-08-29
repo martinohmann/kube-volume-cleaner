@@ -234,44 +234,6 @@ func TestGetPodForStatefulSet(t *testing.T) {
 	assert.Len(t, pods, 0)
 }
 
-func TestUpdateStatefulSetLabel(t *testing.T) {
-	pvc := newPVC("the-pvc", "the-ns")
-	set := newStatefulSet(1, "the-statefulset", "the-ns")
-
-	newLabel, oldLabel := updateStatefulSetLabel(pvc, set)
-
-	assert.Empty(t, oldLabel)
-	assert.Equal(t, "the-statefulset", newLabel)
-	require.Len(t, pvc.Labels, 1)
-	assert.Equal(t, "the-statefulset", pvc.Labels[StatefulSetLabel])
-
-	newLabel, oldLabel = updateStatefulSetLabel(pvc, set)
-
-	assert.Equal(t, "the-statefulset", oldLabel)
-	assert.Equal(t, "the-statefulset", newLabel)
-
-	set = newStatefulSet(1, "other-statefulset", "the-ns")
-
-	newLabel, oldLabel = updateStatefulSetLabel(pvc, set)
-
-	assert.Equal(t, "the-statefulset", oldLabel)
-	assert.Equal(t, "other-statefulset", newLabel)
-	require.Len(t, pvc.Labels, 1)
-	assert.Equal(t, "other-statefulset", pvc.Labels[StatefulSetLabel])
-
-	newLabel, oldLabel = updateStatefulSetLabel(pvc, nil)
-
-	assert.Equal(t, "other-statefulset", oldLabel)
-	assert.Empty(t, newLabel)
-	require.Len(t, pvc.Labels, 0)
-
-	newLabel, oldLabel = updateStatefulSetLabel(pvc, nil)
-
-	assert.Empty(t, oldLabel)
-	assert.Empty(t, newLabel)
-	require.Len(t, pvc.Labels, 0)
-}
-
 func TestHandlePodUpdate(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -366,12 +328,11 @@ func TestHandleStatefulSetUpdate(t *testing.T) {
 			expectedQueueLen: 1,
 		},
 		{
-			name:        "only handles statefulsets matching the label selector",
-			selector:    "foo=bar",
+			name:        "no pods owned by statefulset",
 			statefulSet: newStatefulSetWithUID(1, "foo", "default", "123"),
 			initialObjs: []runtime.Object{
 				newPodWithOwnerRefs("bar", "default", []metav1.OwnerReference{
-					newOwnerRef("foo", "StatefulSet", "123"),
+					newOwnerRef("baz", "StatefulSet", "456"),
 				}),
 				newPod("qux", "default"),
 			},
@@ -381,7 +342,7 @@ func TestHandleStatefulSetUpdate(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			c, err := newFakeControllerWithLabelSelector(test.selector, test.initialObjs...)
+			c, err := newFakeController(test.initialObjs...)
 
 			require.NoError(t, err)
 

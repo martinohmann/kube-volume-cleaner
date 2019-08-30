@@ -23,27 +23,17 @@ func podHasVolumeClaim(pod *corev1.Pod, claimName string) bool {
 	return false
 }
 
-// getStatefulSetLabel looks up the PersistentVolumeClaims StatefulSetLabel and
-// returns it. The second return value denotes whether the label was found or
-// not.
-func getStatefulSetLabel(pvc *corev1.PersistentVolumeClaim) (string, bool) {
-	if len(pvc.Labels) == 0 {
+// getStatefulSetAnnotation looks up the PersistentVolumeClaims
+// StatefulSetAnnotation and returns it. The second return value denotes
+// whether the annotation was found or not.
+func getStatefulSetAnnotation(pvc *corev1.PersistentVolumeClaim) (string, bool) {
+	if len(pvc.Annotations) == 0 {
 		return "", false
 	}
 
-	value, found := pvc.Labels[StatefulSetLabel]
+	value, found := pvc.Annotations[StatefulSetAnnotation]
 
 	return value, found
-}
-
-// getStatefulSetLabelSelector creates a label selector which can be used to
-// list PersistentVolumeClaims that have a StatefulSetLabel with name.
-func getStatefulSetLabelSelector(name string) labels.Selector {
-	set := labels.Set(map[string]string{
-		StatefulSetLabel: name,
-	})
-
-	return labels.SelectorFromSet(set)
 }
 
 // isStatefulSetOwnerRef checks if ownerRef points to an apps/v1 StatefulSet.

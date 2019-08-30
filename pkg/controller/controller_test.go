@@ -8,8 +8,10 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
@@ -32,10 +34,10 @@ func fakeIndexerAdd(t *testing.T, c *Controller, objs ...runtime.Object) {
 
 func TestGetVolumeClaimsForStatefulSet(t *testing.T) {
 	initialObjs := []runtime.Object{
-		newPVCWithStatefulSetLabel("foo", "default", "the-statefulset"),
-		newPVCWithStatefulSetLabel("bar", "default", "the-other-statefulset"),
-		newPVCWithStatefulSetLabel("bar-foo", "default", "the-statefulset"),
-		newPVCWithStatefulSetLabel("baz", "kube-system", "the-statefulset"),
+		newPVCWithStatefulSetAnnotation("foo", "default", "the-statefulset"),
+		newPVCWithStatefulSetAnnotation("bar", "default", "the-other-statefulset"),
+		newPVCWithStatefulSetAnnotation("bar-foo", "default", "the-statefulset"),
+		newPVCWithStatefulSetAnnotation("baz", "kube-system", "the-statefulset"),
 		newPVC("qux", "default"),
 	}
 
@@ -50,8 +52,8 @@ func TestGetVolumeClaimsForStatefulSet(t *testing.T) {
 	require.NoError(t, err)
 
 	expected := []*corev1.PersistentVolumeClaim{
-		newPVCWithStatefulSetLabel("foo", "default", "the-statefulset"),
-		newPVCWithStatefulSetLabel("bar-foo", "default", "the-statefulset"),
+		newPVCWithStatefulSetAnnotation("foo", "default", "the-statefulset"),
+		newPVCWithStatefulSetAnnotation("bar-foo", "default", "the-statefulset"),
 	}
 
 	assert.ElementsMatch(t, expected, pvcs)
@@ -234,41 +236,65 @@ func TestGetPodForStatefulSet(t *testing.T) {
 	assert.Len(t, pods, 0)
 }
 
-func TestHandlePodUpdate(t *testing.T) {
+func TestSyncPod(t *testing.T) {
 	tests := []struct {
-		name             string
-		pod              *corev1.Pod
-		initialObjs      []runtime.Object
-		expectedQueueLen int
-		expectError      bool
+		name          string
+		key           string
+		initialObjs   []runtime.Object
+		expectedError string
+		prepare       func(t *testing.T, c *Controller)
+		validate      func(t *testing.T, c *Controller)
 	}{
 		{
-			name: "pod update enqueues pvcs found in pod volumes",
-			pod: newPodWithVolumes("foo", "default", []corev1.Volume{
-				newVolumeWithClaim("some-vol", "foo"),
-			}),
-			initialObjs: []runtime.Object{
-				newPVC("foo", "default"),
-				newPVC("bar", "default"),
-				newPVC("bar", "kube-system"),
-			},
-			expectedQueueLen: 1,
+			name:          "invalid key",
+			key:           "foo/bar/baz",
+			expectedError: `unexpected key format: "foo/bar/baz"`,
 		},
 		{
-			name: "pod update with deletion timestamp does not enqueue pvcs",
-			pod: func() *corev1.Pod {
-				pod := newPodWithVolumes("foo", "default", []corev1.Volume{
-					newVolumeWithClaim("some-vol", "foo"),
-				})
-				pod.DeletionTimestamp = new(metav1.Time)
-				return pod
-			}(),
+			name: "deleted pod enqueues all pvcs in pod namespace",
+			key:  "default/foo",
 			initialObjs: []runtime.Object{
 				newPVC("foo", "default"),
 				newPVC("bar", "default"),
 				newPVC("bar", "kube-system"),
 			},
-			expectedQueueLen: 0,
+			validate: func(t *testing.T, c *Controller) {
+				assert.Equal(t, 2, c.pvcQueue.Len())
+			},
+		},
+		{
+			name: "pod update enqueue mounted pvcs",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPodWithVolumes("foo", "default", []corev1.Volume{
+					newVolumeWithClaim("some-vol", "foo"),
+				}),
+				newPVC("foo", "default"),
+				newPVC("bar", "default"),
+				newPVC("bar", "kube-system"),
+			},
+			validate: func(t *testing.T, c *Controller) {
+				assert.Equal(t, 1, c.pvcQueue.Len())
+			},
+		},
+		{
+			name: "pod with deletion timestamp does not enqueue pvcs",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				func() *corev1.Pod {
+					pod := newPodWithVolumes("foo", "default", []corev1.Volume{
+						newVolumeWithClaim("some-vol", "foo"),
+					})
+					pod.DeletionTimestamp = new(metav1.Time)
+					return pod
+				}(),
+				newPVC("foo", "default"),
+				newPVC("bar", "default"),
+				newPVC("bar", "kube-system"),
+			},
+			validate: func(t *testing.T, c *Controller) {
+				assert.Equal(t, 0, c.pvcQueue.Len())
+			},
 		},
 	}
 
@@ -278,65 +304,81 @@ func TestHandlePodUpdate(t *testing.T) {
 
 			require.NoError(t, err)
 
+			if test.prepare != nil {
+				test.prepare(t, c)
+			}
+
 			fakeIndexerAdd(t, c, test.initialObjs...)
 
-			err = c.handlePodUpdate(test.pod)
-			if test.expectError {
+			err = c.syncPod(test.key)
+			if test.expectedError != "" {
 				require.Error(t, err)
+				assert.Equal(t, test.expectedError, err.Error())
 			} else {
 				require.NoError(t, err)
-				assert.Equal(t, test.expectedQueueLen, c.pvcQueue.Len())
+			}
+
+			if test.validate != nil {
+				test.validate(t, c)
 			}
 		})
 	}
 }
 
-func TestPodDeletionEnqueuesPVCsInNamespace(t *testing.T) {
-	pvc1 := newPVC("foo", "default")
-	pvc2 := newPVC("bar", "default")
-	pvc3 := newPVC("bar", "kube-system")
-
-	c, err := newFakeController(pvc1, pvc2, pvc3)
-
-	require.NoError(t, err)
-
-	fakeIndexerAdd(t, c, pvc1, pvc2, pvc3)
-
-	require.NoError(t, c.handlePodDeletion("default", "foo"))
-
-	assert.Equal(t, 2, c.pvcQueue.Len())
-}
-
-func TestHandleStatefulSetUpdate(t *testing.T) {
+func TestSyncStatefulSet(t *testing.T) {
 	tests := []struct {
-		name             string
-		selector         string
-		statefulSet      *appsv1.StatefulSet
-		initialObjs      []runtime.Object
-		expectedQueueLen int
-		expectError      bool
+		name          string
+		key           string
+		initialObjs   []runtime.Object
+		expectedError string
+		prepare       func(t *testing.T, c *Controller)
+		validate      func(t *testing.T, c *Controller)
 	}{
 		{
-			name:        "statefulset update enqueues pods owned by statefulset",
-			statefulSet: newStatefulSetWithUID(1, "foo", "default", "123"),
+			name:          "invalid key",
+			key:           "foo/bar/baz",
+			expectedError: `unexpected key format: "foo/bar/baz"`,
+		},
+		{
+			name: "statefulset update enqueues pods owned by statefulset",
+			key:  "default/foo",
 			initialObjs: []runtime.Object{
+				newStatefulSetWithUID(1, "foo", "default", "123"),
 				newPodWithOwnerRefs("bar", "default", []metav1.OwnerReference{
 					newOwnerRef("foo", "StatefulSet", "123"),
 				}),
 				newPod("qux", "default"),
 			},
-			expectedQueueLen: 1,
+			validate: func(t *testing.T, c *Controller) {
+				assert.Equal(t, 1, c.podQueue.Len())
+			},
 		},
 		{
-			name:        "no pods owned by statefulset",
-			statefulSet: newStatefulSetWithUID(1, "foo", "default", "123"),
+			name: "no pods owned by statefulset",
+			key:  "default/foo",
 			initialObjs: []runtime.Object{
+				newStatefulSetWithUID(1, "foo", "default", "123"),
 				newPodWithOwnerRefs("bar", "default", []metav1.OwnerReference{
-					newOwnerRef("baz", "StatefulSet", "456"),
+					newOwnerRef("foo", "StatefulSet", "456"),
 				}),
 				newPod("qux", "default"),
 			},
-			expectedQueueLen: 0,
+			validate: func(t *testing.T, c *Controller) {
+				assert.Equal(t, 0, c.podQueue.Len())
+			},
+		},
+		{
+			name: "statefulset deletion enqueues annotated pvcs in namespace",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVC("foo", "default"),
+				newPVCWithStatefulSetAnnotation("bar", "default", "foo"),
+				newPVCWithStatefulSetAnnotation("baz", "kube-system", "foo"),
+				newPVC("bar", "kube-system"),
+			},
+			validate: func(t *testing.T, c *Controller) {
+				assert.Equal(t, 1, c.pvcQueue.Len())
+			},
 		},
 	}
 
@@ -346,36 +388,252 @@ func TestHandleStatefulSetUpdate(t *testing.T) {
 
 			require.NoError(t, err)
 
+			if test.prepare != nil {
+				test.prepare(t, c)
+			}
+
 			fakeIndexerAdd(t, c, test.initialObjs...)
 
-			err = c.handleStatefulSetUpdate(test.statefulSet)
-			if test.expectError {
+			err = c.syncStatefulSet(test.key)
+			if test.expectedError != "" {
 				require.Error(t, err)
+				assert.Equal(t, test.expectedError, err.Error())
 			} else {
 				require.NoError(t, err)
-				assert.Equal(t, test.expectedQueueLen, c.podQueue.Len())
+			}
+
+			if test.validate != nil {
+				test.validate(t, c)
 			}
 		})
 	}
 }
 
-func TestStatefulSetDeletionEnqueuesLabeledPVCsInNamespace(t *testing.T) {
-	initialObjs := []runtime.Object{
-		newPVC("foo", "default"),
-		newPVCWithStatefulSetLabel("bar", "default", "foo"),
-		newPVCWithStatefulSetLabel("baz", "kube-system", "foo"),
-		newPVC("bar", "kube-system"),
+func TestSyncVolumeClaim(t *testing.T) {
+	tests := []struct {
+		name          string
+		key           string
+		initialObjs   []runtime.Object
+		expectedError string
+		prepare       func(t *testing.T, c *Controller)
+		validate      func(t *testing.T, c *Controller)
+	}{
+		{
+			name:          "invalid key",
+			key:           "foo/bar/baz",
+			expectedError: `unexpected key format: "foo/bar/baz"`,
+		},
+		{
+			name: "deleted pvc does not result in error",
+			key:  "default/foo",
+		},
+		{
+			name: "pvc with deletion timestamp is not processed again",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				func() *corev1.PersistentVolumeClaim {
+					pvc := newPVC("foo", "default")
+					pvc.DeletionTimestamp = new(metav1.Time)
+					return pvc
+				}(),
+			},
+			validate: func(t *testing.T, c *Controller) {
+				pvc, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+				require.NotNil(t, pvc)
+
+				assert.Len(t, pvc.Annotations, 0)
+			},
+		},
+		{
+			name: "remove annotation if pod mounting pvc is not part of statefulset",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+				newPodWithVolumes("bar", "default", []corev1.Volume{
+					newVolumeWithClaim("vol", "foo"),
+				}),
+			},
+			validate: func(t *testing.T, c *Controller) {
+				pvc, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+
+				assert.Len(t, pvc.Annotations, 0)
+			},
+		},
+		{
+			name: "add annotation pvc is managed by statefulset",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVC("foo", "default"),
+				newPodWithVolumesAndOwnerRefs(
+					"bar",
+					"default",
+					[]corev1.Volume{newVolumeWithClaim("vol", "foo")},
+					[]metav1.OwnerReference{newOwnerRef("the-set", "StatefulSet", "123")},
+				),
+				newStatefulSetWithUID(1, "the-set", "default", "123"),
+			},
+			validate: func(t *testing.T, c *Controller) {
+				pvc, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+
+				assert.Equal(t, "the-set", pvc.Annotations[StatefulSetAnnotation])
+			},
+		},
+		{
+			name: "update annotation if statefulset for pvc changed",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+				newPodWithVolumesAndOwnerRefs(
+					"bar",
+					"default",
+					[]corev1.Volume{newVolumeWithClaim("vol", "foo")},
+					[]metav1.OwnerReference{newOwnerRef("baz", "StatefulSet", "123")},
+				),
+				newStatefulSetWithUID(1, "baz", "default", "123"),
+			},
+			validate: func(t *testing.T, c *Controller) {
+				pvc, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+
+				assert.Equal(t, "baz", pvc.Annotations[StatefulSetAnnotation])
+			},
+		},
+		{
+			name: "remove annotation if statefulset does not match label selector",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+				newPodWithVolumesAndOwnerRefs(
+					"bar",
+					"default",
+					[]corev1.Volume{newVolumeWithClaim("vol", "foo")},
+					[]metav1.OwnerReference{newOwnerRef("the-set", "StatefulSet", "123")},
+				),
+				newStatefulSetWithUID(1, "the-set", "default", "123"),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				selector, _ := labels.Parse("foo=bar")
+				c.labelSelector = selector
+			},
+			validate: func(t *testing.T, c *Controller) {
+				pvc, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+
+				assert.Len(t, pvc.Annotations, 0)
+			},
+		},
+		{
+			name: "remove annotation if statefulset does not match label selector (2)",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+				newStatefulSetWithUID(1, "the-set", "default", "123"),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				selector, _ := labels.Parse("foo=bar")
+				c.labelSelector = selector
+			},
+			validate: func(t *testing.T, c *Controller) {
+				pvc, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+
+				assert.Len(t, pvc.Annotations, 0)
+			},
+		},
+		{
+			name: "pod references unknown statefulset",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+				newPodWithVolumesAndOwnerRefs(
+					"bar",
+					"default",
+					[]corev1.Volume{newVolumeWithClaim("vol", "foo")},
+					[]metav1.OwnerReference{newOwnerRef("the-set", "StatefulSet", "123")},
+				),
+			},
+			expectedError: `statefulset.apps "the-set" not found`,
+		},
+		{
+			name: "delete pvc with annotation if not mounted and statefulset deleted",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+			},
+			validate: func(t *testing.T, c *Controller) {
+				_, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.True(t, apierrors.IsNotFound(err))
+			},
+		},
+		{
+			name: "do not delete pvc with annotation if not mounted and statefulset deleted in dry run mode",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				c.dryRun = true
+			},
+			validate: func(t *testing.T, c *Controller) {
+				_, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "do not delete pvc if annotation not present",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVC("foo", "default"),
+			},
+			validate: func(t *testing.T, c *Controller) {
+				_, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "do not delete pvc if statefulset is still present",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+				newStatefulSetWithUID(1, "the-set", "default", "123"),
+			},
+			validate: func(t *testing.T, c *Controller) {
+				pvc, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+
+				assert.Equal(t, "the-set", pvc.Annotations[StatefulSetAnnotation])
+			},
+		},
 	}
 
-	c, err := newFakeController(initialObjs...)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c, err := newFakeController(test.initialObjs...)
 
-	require.NoError(t, err)
+			require.NoError(t, err)
 
-	fakeIndexerAdd(t, c, initialObjs...)
+			if test.prepare != nil {
+				test.prepare(t, c)
+			}
 
-	require.NoError(t, c.handleStatefulSetDeletion("default", "foo"))
+			fakeIndexerAdd(t, c, test.initialObjs...)
 
-	assert.Equal(t, 1, c.pvcQueue.Len())
+			err = c.syncVolumeClaim(test.key)
+			if test.expectedError != "" {
+				require.Error(t, err)
+				assert.Equal(t, test.expectedError, err.Error())
+			} else {
+				require.NoError(t, err)
+			}
+
+			if test.validate != nil {
+				test.validate(t, c)
+			}
+		})
+	}
 }
 
 func TestPodHasVolumeClaim(t *testing.T) {
@@ -491,11 +749,11 @@ func newPVC(name, namespace string) *corev1.PersistentVolumeClaim {
 	}
 }
 
-func newPVCWithStatefulSetLabel(name, namespace, statefulSetName string) *corev1.PersistentVolumeClaim {
+func newPVCWithStatefulSetAnnotation(name, namespace, statefulSetName string) *corev1.PersistentVolumeClaim {
 	pvc := newPVC(name, namespace)
 
-	pvc.Labels = map[string]string{
-		StatefulSetLabel: statefulSetName,
+	pvc.Annotations = map[string]string{
+		StatefulSetAnnotation: statefulSetName,
 	}
 
 	return pvc

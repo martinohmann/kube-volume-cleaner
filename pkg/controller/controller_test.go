@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/martinohmann/kube-volume-cleaner/pkg/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
@@ -636,70 +637,14 @@ func TestSyncVolumeClaim(t *testing.T) {
 	}
 }
 
-func TestPodHasVolumeClaim(t *testing.T) {
-	tests := []struct {
-		name      string
-		pod       *corev1.Pod
-		claimName string
-		expected  bool
-	}{
-		{
-			name: "pod with matching claim",
-			pod: newPodWithVolumes("foo", "default", []corev1.Volume{
-				newVolumeWithClaim("some-vol", "bar"),
-			}),
-			claimName: "bar",
-			expected:  true,
-		},
-		{
-			name: "pod with other volumes and matching claim",
-			pod: newPodWithVolumes("foo", "default", []corev1.Volume{
-				newVolumeWithHostPath("host-vol", "/var/run"),
-				newVolumeWithClaim("some-vol", "bar"),
-				newVolumeWithClaim("some-other-vol", "baz"),
-			}),
-			claimName: "bar",
-			expected:  true,
-		},
-		{
-			name: "pod without matching claim",
-			pod: newPodWithVolumes("foo", "default", []corev1.Volume{
-				newVolumeWithClaim("some-vol", "foo"),
-			}),
-			claimName: "bar",
-			expected:  false,
-		},
-		{
-			name:      "pod without volumes",
-			pod:       newPod("foo", "default"),
-			claimName: "bar",
-			expected:  false,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			assert.Equal(t, test.expected, podHasVolumeClaim(test.pod, test.claimName))
-		})
-	}
-}
-
 func newFakeController(initialObjects ...runtime.Object) (*Controller, error) {
 	return newFakeControllerWithLabelSelectorAndNamespace("", metav1.NamespaceAll, initialObjects...)
-}
-
-func newFakeControllerWithNamespace(namespace string, initialObjects ...runtime.Object) (*Controller, error) {
-	return newFakeControllerWithLabelSelectorAndNamespace("", namespace, initialObjects...)
-}
-
-func newFakeControllerWithLabelSelector(selector string, initialObjects ...runtime.Object) (*Controller, error) {
-	return newFakeControllerWithLabelSelectorAndNamespace(selector, metav1.NamespaceAll, initialObjects...)
 }
 
 func newFakeControllerWithLabelSelectorAndNamespace(selector, namespace string, initialObjects ...runtime.Object) (*Controller, error) {
 	client := fake.NewSimpleClientset(initialObjects...)
 
-	return New(client, namespace, selector, false)
+	return New(client, &config.Options{LabelSelector: selector, Namespace: namespace})
 }
 
 func newPod(name, namespace string) *corev1.Pod {

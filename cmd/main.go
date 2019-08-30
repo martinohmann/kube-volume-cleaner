@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/martinohmann/kube-volume-cleaner/pkg/config"
 	"github.com/martinohmann/kube-volume-cleaner/pkg/controller"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -26,19 +27,17 @@ func init() {
 // NewRootCommand creates a new *cobra.Command that is used as the root command
 // for kube-volume-cleaner.
 func NewRootCommand() *cobra.Command {
-	o := &Options{}
+	o := &config.Options{}
 
 	cmd := &cobra.Command{
 		Use:  "kube-volume-cleaner",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return o.Run()
+			return Run(o)
 		},
 	}
 
-	cmd.Flags().BoolVar(&o.DryRun, "dry-run", o.DryRun, "If set, delete actions will only be printed but not executed")
-	cmd.Flags().StringVar(&o.Namespace, "namespace", o.Namespace, "Namespace to watch. If empty, all namespaces are watched")
-	cmd.Flags().StringVar(&o.LabelSelector, "label-selector", o.LabelSelector, "If set, only statefulsets matching the label selector will be watched.")
+	o.AddFlags(cmd)
 
 	return cmd
 }
@@ -55,23 +54,16 @@ func Execute() {
 	}
 }
 
-// Options holds the options that can be configured via cli flags.
-type Options struct {
-	Namespace     string
-	LabelSelector string
-	DryRun        bool
-}
-
 // Run sets up that controller and initiates the controller loop.
-func (o *Options) Run() error {
+func Run(options *config.Options) error {
 	client, err := newClient()
 	if err != nil {
 		return errors.Wrapf(err, "initializing kubernetes client failed")
 	}
 
-	klog.Infof("running with options: %#v", o)
+	klog.Infof("running with options: %#v", options)
 
-	controller, err := controller.New(client, o.Namespace, o.LabelSelector, o.DryRun)
+	controller, err := controller.New(client, options)
 	if err != nil {
 		return errors.Wrapf(err, "failed to initialize controller")
 	}

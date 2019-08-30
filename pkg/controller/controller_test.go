@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 )
 
 func fakeIndexerAdd(t *testing.T, c *Controller, objs ...runtime.Object) {
@@ -130,10 +131,10 @@ func TestGetStatefulSet(t *testing.T) {
 
 func TestGetStatefulSetForPod(t *testing.T) {
 	tests := []struct {
-		name        string
-		pod         *corev1.Pod
-		expectError bool
-		expected    *appsv1.StatefulSet
+		name          string
+		pod           *corev1.Pod
+		expectedError string
+		expected      *appsv1.StatefulSet
 	}{
 		{
 			name: "ownerRef match, statefulset exists",
@@ -161,7 +162,7 @@ func TestGetStatefulSetForPod(t *testing.T) {
 			pod: newPodWithOwnerRefs("foo", "default", []metav1.OwnerReference{
 				newOwnerRef("other-set", "StatefulSet", "456"),
 			}),
-			expectError: true,
+			expectedError: `statefulset.apps "other-set" not found`,
 		},
 	}
 
@@ -177,8 +178,9 @@ func TestGetStatefulSetForPod(t *testing.T) {
 
 			s, err := c.getStatefulSetForPod(test.pod)
 
-			if test.expectError {
+			if test.expectedError != "" {
 				require.Error(t, err)
+				assert.Equal(t, test.expectedError, err.Error())
 			} else {
 				require.NoError(t, err)
 				assert.Equal(t, test.expected, s)
@@ -548,7 +550,7 @@ func TestSyncVolumeClaim(t *testing.T) {
 			name: "pod references unknown statefulset",
 			key:  "default/foo",
 			initialObjs: []runtime.Object{
-				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+				newPVC("foo", "default"),
 				newPodWithVolumesAndOwnerRefs(
 					"bar",
 					"default",
@@ -556,7 +558,12 @@ func TestSyncVolumeClaim(t *testing.T) {
 					[]metav1.OwnerReference{newOwnerRef("the-set", "StatefulSet", "123")},
 				),
 			},
-			expectedError: `statefulset.apps "the-set" not found`,
+			validate: func(t *testing.T, c *Controller) {
+				pvc, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+
+				assert.Len(t, pvc.Annotations, 0)
+			},
 		},
 		{
 			name: "delete pvc with annotation if not mounted and statefulset deleted",
@@ -570,13 +577,28 @@ func TestSyncVolumeClaim(t *testing.T) {
 			},
 		},
 		{
-			name: "do not delete pvc with annotation if not mounted and statefulset deleted in dry run mode",
+			name: "deletion attempt of already deleted pvc does not cause error",
 			key:  "default/foo",
 			initialObjs: []runtime.Object{
 				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
 			},
 			prepare: func(t *testing.T, c *Controller) {
-				c.dryRun = true
+				fakeClient := c.client.(*fake.Clientset)
+				fakeClient.PrependReactor("*", "persistentvolumeclaims", func(action clienttesting.Action) (handled bool, ret runtime.Object, err error) {
+					deleteAction := action.(clienttesting.DeleteAction)
+					gvr := deleteAction.GetResource()
+					return true, nil, apierrors.NewNotFound(gvr.GroupResource(), deleteAction.GetName())
+				})
+			},
+		},
+		{
+			name: "do not delete pvc with annotation if not mounted and statefulset deleted in no-delete mode",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				c.noDelete = true
 			},
 			validate: func(t *testing.T, c *Controller) {
 				_, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})

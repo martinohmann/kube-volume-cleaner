@@ -30,31 +30,45 @@ const (
 	// PersistentVolumeClaims after the deletion of a StatefulSet.
 	StatefulSetAnnotation = "statefulset.kube-volume-cleaner.io/managed-by"
 
+	// DeleteAfterAnnotation is added to PersistentVolumeClaims that should be
+	// deleted only after the specified moment in time. The annotation is set
+	// once the managing StatefulSet and the Pod mounting the
+	// PersistentVolumeClaim are deleted and the controller is configured to
+	// run with a delete-after value > 0s.
+	DeleteAfterAnnotation = "pvc.kube-volume-cleaner.io/delete-after"
+
 	// maxSyncAttempts is the number of attempts to make to sync a given object
 	// key before giving up.
 	maxSyncAttempts = 5
 )
 
+// Controller watches for PersistentVolumeClaims that where created by a
+// StatefulSet and will delete them once the StatefulSet and its Pods are
+// deleted.
 type Controller struct {
 	client kubernetes.Interface
+
+	labelSelector  labels.Selector
+	namespace      string
+	noDelete       bool
+	deleteAfter    time.Duration
+	resyncInterval time.Duration
 
 	podQueue workqueue.RateLimitingInterface
 	pvcQueue workqueue.RateLimitingInterface
 	setQueue workqueue.RateLimitingInterface
 
-	labelSelector labels.Selector
-	noDelete      bool
+	podLister corev1listers.PodLister
+	pvcLister corev1listers.PersistentVolumeClaimLister
+	setLister appsv1listers.StatefulSetLister
 
 	podInformer cache.SharedIndexInformer
-	podLister   corev1listers.PodLister
-
 	pvcInformer cache.SharedIndexInformer
-	pvcLister   corev1listers.PersistentVolumeClaimLister
-
 	setInformer cache.SharedIndexInformer
-	setLister   appsv1listers.StatefulSetLister
 }
 
+// New creates a new *Controller with client and options. Will return an error
+// if options contain malformed values.
 func New(client kubernetes.Interface, options *config.Options) (*Controller, error) {
 	labelSelector, err := labels.Parse(options.LabelSelector)
 	if err != nil {
@@ -64,27 +78,29 @@ func New(client kubernetes.Interface, options *config.Options) (*Controller, err
 	indexers := cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}
 
 	podListWatcher := listwatch.NewPodListWatcher(client, options.Namespace)
-	podInformer := cache.NewSharedIndexInformer(podListWatcher, &corev1.Pod{}, 0, indexers)
-
 	pvcListWatcher := listwatch.NewPersistentVolumeClaimListWatcher(client, options.Namespace)
-	pvcInformer := cache.NewSharedIndexInformer(pvcListWatcher, &corev1.PersistentVolumeClaim{}, 0, indexers)
-
 	setListWatcher := listwatch.NewStatefulSetListWatcher(client, options.Namespace)
+
+	podInformer := cache.NewSharedIndexInformer(podListWatcher, &corev1.Pod{}, 0, indexers)
+	pvcInformer := cache.NewSharedIndexInformer(pvcListWatcher, &corev1.PersistentVolumeClaim{}, 0, indexers)
 	setInformer := cache.NewSharedIndexInformer(setListWatcher, &appsv1.StatefulSet{}, 0, indexers)
 
 	c := &Controller{
-		client:        client,
-		podInformer:   podInformer,
-		podLister:     corev1listers.NewPodLister(podInformer.GetIndexer()),
-		podQueue:      workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
-		pvcInformer:   pvcInformer,
-		pvcLister:     corev1listers.NewPersistentVolumeClaimLister(pvcInformer.GetIndexer()),
-		pvcQueue:      workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
-		setInformer:   setInformer,
-		setLister:     appsv1listers.NewStatefulSetLister(setInformer.GetIndexer()),
-		setQueue:      workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
-		labelSelector: labelSelector,
-		noDelete:      options.NoDelete,
+		client:         client,
+		labelSelector:  labelSelector,
+		namespace:      options.Namespace,
+		noDelete:       options.NoDelete,
+		deleteAfter:    options.DeleteAfter,
+		resyncInterval: options.ResyncInterval,
+		podInformer:    podInformer,
+		pvcInformer:    pvcInformer,
+		setInformer:    setInformer,
+		podLister:      corev1listers.NewPodLister(podInformer.GetIndexer()),
+		pvcLister:      corev1listers.NewPersistentVolumeClaimLister(pvcInformer.GetIndexer()),
+		setLister:      appsv1listers.NewStatefulSetLister(setInformer.GetIndexer()),
+		podQueue:       workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		pvcQueue:       workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		setQueue:       workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
 	}
 
 	c.registerEventHandlers()
@@ -142,6 +158,7 @@ func (c *Controller) enqueue(queue workqueue.Interface, obj interface{}, kind st
 	klog.V(5).Infof("enqueued %s %q for sync", kind, key)
 }
 
+// Run starts the controller and will block until stopCh is closed.
 func (c *Controller) Run(stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 
@@ -161,6 +178,7 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 		return
 	}
 
+	go wait.Until(c.resync, c.resyncInterval, stopCh)
 	go wait.Until(worker(c.podQueue, c.syncPod, "pod"), time.Second, stopCh)
 	go wait.Until(worker(c.pvcQueue, c.syncVolumeClaim, "pvc"), time.Second, stopCh)
 	go wait.Until(worker(c.setQueue, c.syncStatefulSet, "statefulset"), time.Second, stopCh)
@@ -169,6 +187,9 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 	klog.Info("stopping controller")
 }
 
+// worker returns a function that can be used as a worker to consume queue and
+// call syncFunc for every key obtained from the queue. Kind just denotes the
+// object kind to add some context to log messages.
 func worker(queue workqueue.RateLimitingInterface, syncFunc func(string) error, kind string) func() {
 	return func() {
 		workFunc := func() bool {
@@ -191,6 +212,10 @@ func worker(queue workqueue.RateLimitingInterface, syncFunc func(string) error, 
 	}
 }
 
+// handleError ensures that key gets requeued for a number of times in case err
+// is non-nil until it gives up and logs the final error. The value of kind is
+// just used to add some context about the type of the object that key points
+// to and is only used in log messages.
 func handleError(queue workqueue.RateLimitingInterface, err error, key interface{}, kind string) {
 	if err == nil {
 		queue.Forget(key)
@@ -208,6 +233,22 @@ func handleError(queue workqueue.RateLimitingInterface, err error, key interface
 	klog.V(1).Infof("dropping key %s %v out of the queue due to error: %v", kind, key, err)
 }
 
+// resync resyncs the controller by enqueuing all PersistentVolumeClaims that
+// are available via the informer. It is expected to call resync periodically.
+func (c *Controller) resync() {
+	klog.V(4).Info("resyncing pvcs")
+
+	pvcs, err := c.pvcLister.PersistentVolumeClaims(c.namespace).List(labels.Everything())
+	if err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+
+	for _, pvc := range pvcs {
+		c.enqueuePersistentVolumeClaim(pvc)
+	}
+}
+
 func (c *Controller) syncPod(key string) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
@@ -218,9 +259,7 @@ func (c *Controller) syncPod(key string) error {
 	pod, err := c.podLister.Pods(namespace).Get(name)
 	if err == nil {
 		return c.handlePodUpdate(pod)
-	}
-
-	if !apierrors.IsNotFound(err) {
+	} else if !apierrors.IsNotFound(err) {
 		klog.V(1).Infof("failed to retrieve pod %q from informer", key)
 		return err
 	}
@@ -230,7 +269,7 @@ func (c *Controller) syncPod(key string) error {
 
 func (c *Controller) handlePodUpdate(pod *corev1.Pod) error {
 	if pod.DeletionTimestamp != nil {
-		// on a restart of the controller, it's possible a new pod shows up in
+		// On a restart of the controller, it's possible a new pod shows up in
 		// a state that is already pending deletion. Prevent the pod from being
 		// a creation/update observation.
 		klog.V(5).Infof("pod %s/%s is in status pending deletion, not handling", pod.Namespace, pod.Name)
@@ -276,9 +315,7 @@ func (c *Controller) syncVolumeClaim(key string) error {
 	pvc, err := c.pvcLister.PersistentVolumeClaims(namespace).Get(name)
 	if err == nil {
 		return c.handleVolumeClaimUpdate(pvc)
-	}
-
-	if !apierrors.IsNotFound(err) {
+	} else if !apierrors.IsNotFound(err) {
 		klog.V(1).Infof("failed to retrieve pvc %q from informer", key)
 		return err
 	}
@@ -286,18 +323,17 @@ func (c *Controller) syncVolumeClaim(key string) error {
 	return c.handleVolumeClaimDeletion(namespace, name)
 }
 
+// handleVolumeClaimUpdate contains the core logic of the controller and takes
+// decisions about whether and when a PersistentVolumeClaim should be deleted.
 func (c *Controller) handleVolumeClaimUpdate(pvc *corev1.PersistentVolumeClaim) error {
 	if pvc.DeletionTimestamp != nil {
-		// on a restart of the controller, it's possible a new pvc shows up in
-		// a state that is already pending deletion. Prevent the pod from being
+		// On a restart of the controller, it's possible a new pvc shows up in
+		// a state that is already pending deletion. Prevent the pvc from being
 		// a creation/update observation.
 		klog.V(5).Infof("pvc %s/%s is in status pending deletion, not handling", pvc.Namespace, pvc.Name)
 		return nil
 	}
 
-	// TODO(mohmann): when the information from the informer cache tells us
-	// that it is safe to delete the pvc, check again against api-server to
-	// doublecheck before attempting deletion
 	pod, err := c.getPodForVolumeClaim(pvc)
 	if err != nil {
 		klog.V(1).Infof("error while getting pod for pvc %s/%s", pvc.Namespace, pvc.Name)
@@ -305,19 +341,32 @@ func (c *Controller) handleVolumeClaimUpdate(pvc *corev1.PersistentVolumeClaim) 
 	}
 
 	if pod != nil {
-		return c.updateVolumeClaimAnnotations(pvc, pod)
+		set, err := c.getStatefulSetForPod(pod)
+		if apierrors.IsNotFound(err) {
+			// This indicates that the pod has an ownerRef that points to a
+			// non-existent statefulset. This can happen during deletion of a
+			// statefulset when the local caches are not aware of the updated pods.
+			// We should NOT try to remove the statefulset annotation from pvc
+			// here, otherwise we will end up with pvcs not being deleted although
+			// they should be.
+			return nil
+		} else if err != nil {
+			klog.V(1).Infof("failed to retrieve statefulset for pod %s/%s", pod.Namespace, pod.Name)
+			return err
+		}
+
+		return c.syncVolumeClaimAnnotations(pvc, set)
 	}
 
-	klog.V(5).Infof("pvc %s/%s is not mounted to a pod, checking if it should be deleted", pvc.Namespace, pvc.Name)
+	klog.V(5).Infof("pvc %s/%s is not mounted to a pod", pvc.Namespace, pvc.Name)
 
-	setName, exists := getStatefulSetAnnotation(pvc)
+	setName, exists := pvc.Annotations[StatefulSetAnnotation]
 	if !exists {
-		// do we need to do something here?
 		klog.V(5).Infof("pvc %s/%s does not have annotation %s, no candidate for deletion", pvc.Namespace, pvc.Name, StatefulSetAnnotation)
 		return nil
 	}
 
-	set, err := c.getStatefulSet(pvc.Namespace, setName)
+	set, err := c.setLister.StatefulSets(pvc.Namespace).Get(setName)
 	if err == nil {
 		if isMatchingSelector(set, c.labelSelector) {
 			klog.V(5).Infof("statefulset %s/%s managing pvc %s/%s still present, not deleting pvc", set.Namespace, set.Name, pvc.Namespace, pvc.Name)
@@ -325,11 +374,22 @@ func (c *Controller) handleVolumeClaimUpdate(pvc *corev1.PersistentVolumeClaim) 
 		}
 
 		klog.V(5).Infof("statefulset %s/%s managing pvc %s/%s does not match label selector %q", set.Namespace, set.Name, pvc.Namespace, pvc.Name, c.labelSelector.String())
-		return c.removeStatefulSetAnnotation(pvc)
+		return c.removeVolumeClaimAnnotations(pvc)
+	} else if !apierrors.IsNotFound(err) {
+		klog.V(1).Infof("failed to retrieve statefulset for pvc %s/%s", pvc.Namespace, pvc.Name)
+		return err
 	}
 
-	if !apierrors.IsNotFound(err) {
-		klog.V(1).Infof("failed to retrieve statefulset for pvc %s/%s", pvc.Namespace, pvc.Name)
+	deleteAfter := c.getDeleteAfter(pvc)
+
+	now := time.Now()
+
+	if deleteAfter.After(now) {
+		return c.updateDeleteAfterAnnotation(pvc, deleteAfter)
+	}
+
+	ok, err := c.isVolumeClaimSafeToDelete(pvc.Name, pvc.Namespace)
+	if err != nil || !ok {
 		return err
 	}
 
@@ -338,69 +398,142 @@ func (c *Controller) handleVolumeClaimUpdate(pvc *corev1.PersistentVolumeClaim) 
 	return c.deleteVolumeClaim(pvc)
 }
 
-func (c *Controller) updateVolumeClaimAnnotations(pvc *corev1.PersistentVolumeClaim, pod *corev1.Pod) error {
-	set, err := c.getStatefulSetForPod(pod)
-
-	switch {
-	case apierrors.IsNotFound(err):
-		// This indicates that the pod has an ownerRef that points to a
-		// non-existent statefulset. This can happen during deletion of a
-		// statefulset when the local caches are not aware of the updated pods.
-		// We should NOT try to remove the statefulset annotation form pvc
-		// here, otherwise we will end up with pvcs not being deleted although
-		// they should be.
-		return nil
-	case err != nil:
-		klog.V(1).Infof("failed to retrieve statefulset for pod %s/%s", pod.Namespace, pod.Name)
-		return err
-	case set == nil:
-		klog.V(4).Infof("pod mounting pvc %s/%s does not belong to statefulset", pvc.Namespace, pvc.Name)
-		return c.removeStatefulSetAnnotation(pvc)
-	case !isMatchingSelector(set, c.labelSelector):
-		klog.V(5).Infof("statefulset %s/%s controlling pod %s/%s does not match label selector %q", set.Namespace, set.Name, pod.Namespace, pod.Name, c.labelSelector.String())
-		return c.removeStatefulSetAnnotation(pvc)
+// getDeleteAfter returns the time encoded in the DeleteAfterAnnotation of pvc,
+// if it exists, or a new time determined by the delete-after configuration
+// value if it did not exist or was unparsable (e.g. because somebody tampered
+// with it).
+func (c *Controller) getDeleteAfter(pvc *corev1.PersistentVolumeClaim) time.Time {
+	value, found := pvc.Annotations[DeleteAfterAnnotation]
+	if !found {
+		return time.Now().Add(c.deleteAfter)
 	}
 
-	return c.updateStatefulSetAnnotation(pvc, set.Name)
+	deleteAfter, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		klog.V(5).Infof("failed to parse %q annotation: %v", DeleteAfterAnnotation, err)
+		deleteAfter = time.Now().Add(c.deleteAfter)
+	}
+
+	return deleteAfter
 }
 
-func (c *Controller) removeStatefulSetAnnotation(pvc *corev1.PersistentVolumeClaim) error {
-	_, found := getStatefulSetAnnotation(pvc)
-	if !found {
-		return nil
+// isVolumeClaimSafeToDelete checks if all preconditions for deleting a PVC are
+// met by querying the api server for live data. This ensures that we do not
+// make wrong decisions based on stale data from cache.
+func (c *Controller) isVolumeClaimSafeToDelete(name, namespace string) (bool, error) {
+	pvc, err := c.client.CoreV1().PersistentVolumeClaims(namespace).Get(name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	} else if err != nil {
+		return false, err
 	}
 
+	podList, err := c.client.CoreV1().Pods(pvc.Namespace).List(metav1.ListOptions{})
+	if err != nil {
+		return false, err
+	}
+
+	var pod *corev1.Pod
+
+	for _, p := range podList.Items {
+		if podHasVolumeClaim(&p, pvc.Name) {
+			pod = &p
+			break
+		}
+	}
+
+	if pod != nil {
+		return false, nil
+	}
+
+	setName, exists := pvc.Annotations[StatefulSetAnnotation]
+	if !exists {
+		return false, nil
+	}
+
+	_, err = c.client.AppsV1().StatefulSets(pvc.Namespace).Get(setName, metav1.GetOptions{})
+	if err == nil {
+		return false, nil
+	} else if !apierrors.IsNotFound(err) {
+		return false, err
+	}
+
+	return !c.getDeleteAfter(pvc).After(time.Now()), nil
+}
+
+// syncVolumeClaimAnnotations synchronizes pvc annotations managed by the
+// controller. The passed in StatefulSet must be the one managing the pvc or
+// nil if there is none. This function will update the StatefulSetAnnotation on
+// pvc with the StatefulSets name. In case the StatefulSet is nil or does not
+// match the configured label selector, it is ensured that this the
+// StatefulSetAnnotation gets removed from the pvc.
+// If we get here there is no way that the pvc should be scheduled for deletion
+// by the controller. Thus, any change of the StatefulSetAnnotation is paired
+// with the removal of the potentially existant DeleteAfterAnnotation from the
+// pvc to ensure scheduled deletions are aborted.
+func (c *Controller) syncVolumeClaimAnnotations(pvc *corev1.PersistentVolumeClaim, set *appsv1.StatefulSet) error {
+	switch {
+	case set == nil:
+		klog.V(4).Infof("pod mounting pvc %s/%s does not belong to statefulset", pvc.Namespace, pvc.Name)
+		return c.removeVolumeClaimAnnotations(pvc)
+	case !isMatchingSelector(set, c.labelSelector):
+		klog.V(5).Infof("statefulset %s/%s managing pvc %s/%s does not match label selector %q", set.Namespace, set.Name, pvc.Namespace, pvc.Name, c.labelSelector.String())
+		return c.removeVolumeClaimAnnotations(pvc)
+	default:
+		return c.updateStatefulSetAnnotation(pvc, set.Name)
+	}
+}
+
+// removeVolumeClaimAnnotations removes all annotations managed by this
+// controller from pvc and syncs the updates to the apiserver if the pvc object
+// changed.
+func (c *Controller) removeVolumeClaimAnnotations(pvc *corev1.PersistentVolumeClaim) error {
 	pvcCopy := pvc.DeepCopy()
 
-	delete(pvcCopy.Annotations, StatefulSetAnnotation)
-
-	klog.Infof("removing annotation %q from pvc %s/%s", StatefulSetAnnotation, pvc.Namespace, pvc.Name)
+	objChanged := removeVolumeClaimAnnotations(pvcCopy, StatefulSetAnnotation, DeleteAfterAnnotation)
+	if !objChanged {
+		return nil
+	}
 
 	return c.updateVolumeClaim(pvcCopy)
 }
 
+// updateStatefulSetAnnotation sets the StatefulSetAnnotation of pvc to
+// newValue if it does not already have it. It also ensures that
+// DeleteAfterAnnotation is remove if present, because if we got here there is
+// no way the pvc is eligible for deletion. If the pvc objects changes due to
+// the annotation updates, it gets synced to the apiserver afterwards.
 func (c *Controller) updateStatefulSetAnnotation(pvc *corev1.PersistentVolumeClaim, newValue string) error {
 	pvcCopy := pvc.DeepCopy()
 
-	oldValue, exists := getStatefulSetAnnotation(pvcCopy)
-	if !exists && pvcCopy.Annotations == nil {
-		pvcCopy.Annotations = map[string]string{}
-	}
+	removed := removeVolumeClaimAnnotations(pvcCopy, DeleteAfterAnnotation)
 
-	pvcCopy.Annotations[StatefulSetAnnotation] = newValue
-	if newValue == oldValue {
+	updated := updateVolumeClaimAnnotation(pvcCopy, StatefulSetAnnotation, newValue)
+	if !removed && !updated {
 		return nil
-	}
-
-	if oldValue == "" {
-		klog.Infof("adding annotation %q on pvc %s/%s: %q", StatefulSetAnnotation, pvc.Namespace, pvc.Name, newValue)
-	} else {
-		klog.Infof("updating annotation %q on pvc %s/%s: %q -> %q", StatefulSetAnnotation, pvc.Namespace, pvc.Name, oldValue, newValue)
 	}
 
 	return c.updateVolumeClaim(pvcCopy)
 }
 
+// updateDeleteAfterAnnotation sets the DeleteAfterAnnotation to the RFC3339
+// string representation of newTime, and syncs the object to the apiserver if
+// the annotation value changed.
+func (c *Controller) updateDeleteAfterAnnotation(pvc *corev1.PersistentVolumeClaim, newTime time.Time) error {
+	newValue := newTime.Format(time.RFC3339)
+	pvcCopy := pvc.DeepCopy()
+
+	updated := updateVolumeClaimAnnotation(pvcCopy, DeleteAfterAnnotation, newValue)
+	if !updated {
+		return nil
+	}
+
+	return c.updateVolumeClaim(pvcCopy)
+}
+
+// deleteVolumeClaim deletes a PersistentVolumeClaim from the cluster. If the
+// controller runs in no-delete mode, the deletion operation is just printed
+// but not executed.
 func (c *Controller) deleteVolumeClaim(pvc *corev1.PersistentVolumeClaim) error {
 	if c.noDelete {
 		klog.Infof("would delete pvc %s/%s, but no-delete mode is enabled", pvc.Namespace, pvc.Name)
@@ -418,6 +551,7 @@ func (c *Controller) deleteVolumeClaim(pvc *corev1.PersistentVolumeClaim) error 
 	return err
 }
 
+// updateVolumeClaim syncs a pvc update to the apiserver.
 func (c *Controller) updateVolumeClaim(pvc *corev1.PersistentVolumeClaim) error {
 	klog.V(5).Infof("updating pvc %s/%s", pvc.Namespace, pvc.Name)
 
@@ -426,6 +560,8 @@ func (c *Controller) updateVolumeClaim(pvc *corev1.PersistentVolumeClaim) error 
 	return err
 }
 
+// handleVolumeClaimDeletion handles PersistentVolumeClaim deletion events
+// emitted by the informer.
 func (c *Controller) handleVolumeClaimDeletion(namespace, name string) error {
 	// Deletions are actually what we want, so there is nothing to do here. We
 	// just log the event anyways for debugging.
@@ -444,9 +580,7 @@ func (c *Controller) syncStatefulSet(key string) error {
 	set, err := c.setLister.StatefulSets(namespace).Get(name)
 	if err == nil {
 		return c.handleStatefulSetUpdate(set)
-	}
-
-	if !apierrors.IsNotFound(err) {
+	} else if !apierrors.IsNotFound(err) {
 		klog.V(1).Infof("failed to retrieve statefulset %q from informer", key)
 		return err
 	}
@@ -475,9 +609,7 @@ func (c *Controller) handleStatefulSetDeletion(namespace, name string) error {
 	if apierrors.IsNotFound(err) {
 		klog.V(4).Infof("statefulset %s/%s does not have any pvcs", namespace, name)
 		return nil
-	}
-
-	if err != nil {
+	} else if err != nil {
 		return err
 	}
 
@@ -496,13 +628,7 @@ func (c *Controller) getPodForVolumeClaim(pvc *corev1.PersistentVolumeClaim) (*c
 		return nil, err
 	}
 
-	for _, pod := range pods {
-		if podHasVolumeClaim(pod, pvc.Name) {
-			return pod, nil
-		}
-	}
-
-	return nil, nil
+	return getPodMountingVolumeClaim(pods, pvc.Name), nil
 }
 
 // getPodsForStatefulSet retrieves all pods from the informer that are
@@ -513,20 +639,7 @@ func (c *Controller) getPodsForStatefulSet(set *appsv1.StatefulSet) ([]*corev1.P
 		return nil, err
 	}
 
-	controlledPods := make([]*corev1.Pod, 0)
-	for _, pod := range pods {
-		if metav1.IsControlledBy(pod, set) {
-			controlledPods = append(controlledPods, pod)
-		}
-	}
-
-	return controlledPods, nil
-}
-
-// getStatefulSet retrieves the StatefulSet with name and namespace from the
-// informer.
-func (c *Controller) getStatefulSet(namespace, name string) (*appsv1.StatefulSet, error) {
-	return c.setLister.StatefulSets(namespace).Get(name)
+	return getControlledPods(pods, set), nil
 }
 
 // getStatefulSetForPod finds that StatefulSet owning pod in the informer. If
@@ -541,9 +654,7 @@ func (c *Controller) getStatefulSetForPod(pod *corev1.Pod) (*appsv1.StatefulSet,
 	if apierrors.IsNotFound(err) {
 		klog.V(5).Infof("pod %s/%s ownerRef points to statefulset %s/%s but it was not found", pod.Namespace, pod.Name, pod.Namespace, ownerRef.Name)
 		return nil, err
-	}
-
-	if err != nil {
+	} else if err != nil {
 		return nil, err
 	}
 
@@ -571,9 +682,7 @@ func (c *Controller) getVolumeClaimsForPod(pod *corev1.Pod) ([]*corev1.Persisten
 		pvc, err := c.pvcLister.PersistentVolumeClaims(pod.Namespace).Get(claimName)
 		if apierrors.IsNotFound(err) {
 			continue
-		}
-
-		if err != nil {
+		} else if err != nil {
 			return nil, err
 		}
 
@@ -592,16 +701,5 @@ func (c *Controller) getVolumeClaimsForStatefulSet(namespace, name string) ([]*c
 		return nil, err
 	}
 
-	managedVolumeClaims := make([]*corev1.PersistentVolumeClaim, 0)
-
-	for _, pvc := range pvcs {
-		value, exists := getStatefulSetAnnotation(pvc)
-		if !exists || value != name {
-			continue
-		}
-
-		managedVolumeClaims = append(managedVolumeClaims, pvc)
-	}
-
-	return managedVolumeClaims, nil
+	return getVolumeClaimsWithAnnotation(pvcs, StatefulSetAnnotation, name), nil
 }

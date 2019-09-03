@@ -27,12 +27,18 @@ func init() {
 // NewRootCommand creates a new *cobra.Command that is used as the root command
 // for kube-volume-cleaner.
 func NewRootCommand() *cobra.Command {
-	o := &config.Options{}
+	o := config.NewDefaultOptions()
 
 	cmd := &cobra.Command{
-		Use:  "kube-volume-cleaner",
-		Args: cobra.NoArgs,
+		Use:          "kube-volume-cleaner",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			err := o.Validate()
+			if err != nil {
+				return err
+			}
+
 			return Run(o)
 		},
 	}

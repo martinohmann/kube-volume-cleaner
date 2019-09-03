@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/martinohmann/kube-volume-cleaner/pkg/config"
 	"github.com/stretchr/testify/assert"
@@ -105,28 +106,6 @@ func TestGetVolumeClaimsForPod(t *testing.T) {
 	}
 
 	assert.Equal(t, expected, pvcs)
-}
-
-func TestGetStatefulSet(t *testing.T) {
-	initialObjs := []runtime.Object{
-		newStatefulSet(1, "foo", "default"),
-	}
-
-	c, err := newFakeController(initialObjs...)
-
-	require.NoError(t, err)
-
-	fakeIndexerAdd(t, c, initialObjs...)
-
-	set, err := c.getStatefulSet("default", "foo")
-
-	require.NoError(t, err)
-
-	assert.Equal(t, initialObjs[0], set)
-
-	_, err = c.getStatefulSet("kube-system", "foo")
-
-	require.Error(t, err)
 }
 
 func TestGetStatefulSetForPod(t *testing.T) {
@@ -505,6 +484,79 @@ func TestSyncVolumeClaim(t *testing.T) {
 			},
 		},
 		{
+			name: "remove deleteAfter annotation if pvc is mounted by pod",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				func() *corev1.PersistentVolumeClaim {
+					pvc := newPVCWithStatefulSetAnnotation("foo", "default", "the-set")
+					pvc.Annotations[DeleteAfterAnnotation] = time.Now().Add(24 * time.Hour).Format(time.RFC3339)
+					return pvc
+				}(),
+				newPodWithVolumesAndOwnerRefs(
+					"bar",
+					"default",
+					[]corev1.Volume{newVolumeWithClaim("vol", "foo")},
+					[]metav1.OwnerReference{newOwnerRef("the-set", "StatefulSet", "123")},
+				),
+				newStatefulSetWithUID(1, "the-set", "default", "123"),
+			},
+			validate: func(t *testing.T, c *Controller) {
+				pvc, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+
+				_, present := pvc.Annotations[DeleteAfterAnnotation]
+
+				assert.Equal(t, "the-set", pvc.Annotations[StatefulSetAnnotation])
+				assert.False(t, present)
+			},
+		},
+		{
+			name: "do not update annotation if statefulset for pvc stays the same",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+				newPodWithVolumesAndOwnerRefs(
+					"bar",
+					"default",
+					[]corev1.Volume{newVolumeWithClaim("vol", "foo")},
+					[]metav1.OwnerReference{newOwnerRef("the-set", "StatefulSet", "123")},
+				),
+				newStatefulSetWithUID(1, "the-set", "default", "123"),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				fakeClient := c.client.(*fake.Clientset)
+				fakeClient.PrependReactor("update", "persistentvolumeclaims", func(action clienttesting.Action) (bool, runtime.Object, error) {
+					t.Fatalf("unexpected pvc update")
+					return true, nil, nil
+				})
+			},
+			validate: func(t *testing.T, c *Controller) {
+				pvc, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+
+				assert.Equal(t, "the-set", pvc.Annotations[StatefulSetAnnotation])
+			},
+		},
+		{
+			name: "do not sync pvc update to apiserver if there is no annotation to delete",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVC("foo", "default"),
+				newPodWithVolumes(
+					"bar",
+					"default",
+					[]corev1.Volume{newVolumeWithClaim("vol", "foo")},
+				),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				fakeClient := c.client.(*fake.Clientset)
+				fakeClient.PrependReactor("update", "persistentvolumeclaims", func(action clienttesting.Action) (bool, runtime.Object, error) {
+					t.Fatalf("unexpected pvc update")
+					return true, nil, nil
+				})
+			},
+		},
+		{
 			name: "remove annotation if statefulset does not match label selector",
 			key:  "default/foo",
 			initialObjs: []runtime.Object{
@@ -584,7 +636,7 @@ func TestSyncVolumeClaim(t *testing.T) {
 			},
 			prepare: func(t *testing.T, c *Controller) {
 				fakeClient := c.client.(*fake.Clientset)
-				fakeClient.PrependReactor("*", "persistentvolumeclaims", func(action clienttesting.Action) (handled bool, ret runtime.Object, err error) {
+				fakeClient.PrependReactor("*", "persistentvolumeclaims", func(action clienttesting.Action) (bool, runtime.Object, error) {
 					deleteAction := action.(clienttesting.DeleteAction)
 					gvr := deleteAction.GetResource()
 					return true, nil, apierrors.NewNotFound(gvr.GroupResource(), deleteAction.GetName())
@@ -630,6 +682,214 @@ func TestSyncVolumeClaim(t *testing.T) {
 				assert.Equal(t, "the-set", pvc.Annotations[StatefulSetAnnotation])
 			},
 		},
+		{
+			name: "mark pvc for deletion if deleteAfter > 0",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				c.deleteAfter = 2 * time.Hour
+			},
+			validate: func(t *testing.T, c *Controller) {
+				pvc, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+
+				assert.NotEmpty(t, pvc.Annotations[DeleteAfterAnnotation])
+
+				deleteAfter := c.getDeleteAfter(pvc)
+
+				assert.True(t, deleteAfter.After(time.Now()))
+			},
+		},
+		{
+			name: "delete pvc if value in deleteAfter annotation is surpassed",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				func() *corev1.PersistentVolumeClaim {
+					pvc := newPVCWithStatefulSetAnnotation("foo", "default", "the-set")
+					pvc.Annotations[DeleteAfterAnnotation] = time.Now().Add(-1 * time.Hour).Format(time.RFC3339)
+					return pvc
+				}(),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				c.deleteAfter = 2 * time.Hour
+			},
+			validate: func(t *testing.T, c *Controller) {
+				_, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.True(t, apierrors.IsNotFound(err))
+			},
+		},
+		{
+			name: "do not update deleteAfter annotation if it is already present",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				func() *corev1.PersistentVolumeClaim {
+					pvc := newPVCWithStatefulSetAnnotation("foo", "default", "the-set")
+					pvc.Annotations[DeleteAfterAnnotation] = time.Now().Add(24 * time.Hour).Format(time.RFC3339)
+					return pvc
+				}(),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				c.deleteAfter = 2 * time.Hour
+
+				fakeClient := c.client.(*fake.Clientset)
+				fakeClient.PrependReactor("update", "persistentvolumeclaims", func(action clienttesting.Action) (bool, runtime.Object, error) {
+					t.Fatalf("unexpected pvc update")
+					return true, nil, nil
+				})
+			},
+			validate: func(t *testing.T, c *Controller) {
+				_, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "invalid deleteAfter annotation will be reset",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				func() *corev1.PersistentVolumeClaim {
+					pvc := newPVCWithStatefulSetAnnotation("foo", "default", "the-set")
+					pvc.Annotations[DeleteAfterAnnotation] = "foobar"
+					return pvc
+				}(),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				c.deleteAfter = 2 * time.Hour
+			},
+			validate: func(t *testing.T, c *Controller) {
+				pvc, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+
+				assert.NotEmpty(t, pvc.Annotations[DeleteAfterAnnotation])
+
+				deleteAfter := c.getDeleteAfter(pvc)
+
+				assert.True(t, deleteAfter.After(time.Now()))
+			},
+		},
+		{
+			name: "cache lists statefulset as deleted, but it is present in api server => do not delete pvc",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				fakeClient := c.client.(*fake.Clientset)
+				fakeClient.PrependReactor("get", "statefulsets", func(action clienttesting.Action) (bool, runtime.Object, error) {
+					getAction := action.(clienttesting.GetAction)
+
+					set := newStatefulSetWithUID(1, getAction.GetName(), getAction.GetNamespace(), "123")
+
+					return true, set, nil
+				})
+			},
+			validate: func(t *testing.T, c *Controller) {
+				_, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "cache has pvc as not mounted by a pod, but api server says otherwise => do not delete pvc",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				fakeClient := c.client.(*fake.Clientset)
+				fakeClient.PrependReactor("list", "pods", func(action clienttesting.Action) (bool, runtime.Object, error) {
+					listAction := action.(clienttesting.ListAction)
+
+					pod := newPodWithVolumes("bar", listAction.GetNamespace(), []corev1.Volume{
+						newVolumeWithClaim("vol", "foo"),
+					})
+
+					podList := &corev1.PodList{
+						Items: []corev1.Pod{*pod},
+					}
+
+					return true, podList, nil
+				})
+			},
+			validate: func(t *testing.T, c *Controller) {
+				_, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "error occured while getting pvc from apiserver => do not delete pvc",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				fakeClient := c.client.(*fake.Clientset)
+				fakeClient.PrependReactor("get", "persistentvolumeclaims", func(action clienttesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewUnauthorized("not authorized")
+				})
+				fakeClient.PrependReactor("delete", "persistentvolumeclaims", func(action clienttesting.Action) (bool, runtime.Object, error) {
+					t.Fatalf("unexpected delete operation")
+					return true, nil, nil
+				})
+			},
+			expectedError: "not authorized",
+		},
+		{
+			name: "error occured while listing pods on apiserver => do not delete pvc",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				fakeClient := c.client.(*fake.Clientset)
+				fakeClient.PrependReactor("list", "pods", func(action clienttesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewUnauthorized("not authorized")
+				})
+			},
+			expectedError: "not authorized",
+			validate: func(t *testing.T, c *Controller) {
+				_, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "error occured while getting statefulset from apiserver => do not delete pvc",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				fakeClient := c.client.(*fake.Clientset)
+				fakeClient.PrependReactor("get", "statefulsets", func(action clienttesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewUnauthorized("not authorized")
+				})
+			},
+			expectedError: "not authorized",
+			validate: func(t *testing.T, c *Controller) {
+				_, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "pvc from apiserver does not have statefulset annotation => do not delete pvc",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+			},
+			prepare: func(t *testing.T, c *Controller) {
+				fakeClient := c.client.(*fake.Clientset)
+				fakeClient.PrependReactor("get", "persistentvolumeclaims", func(action clienttesting.Action) (bool, runtime.Object, error) {
+					getAction := action.(clienttesting.GetAction)
+
+					pvc := newPVC(getAction.GetName(), getAction.GetNamespace())
+					return true, pvc, nil
+				})
+				fakeClient.PrependReactor("delete", "persistentvolumeclaims", func(action clienttesting.Action) (bool, runtime.Object, error) {
+					t.Fatalf("unexpected delete operation")
+					return true, nil, nil
+				})
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -657,6 +917,23 @@ func TestSyncVolumeClaim(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResync(t *testing.T) {
+	initialObjs := []runtime.Object{
+		newPVC("foo", "default"),
+		newPVC("bar", "kube-system"),
+	}
+
+	c, err := newFakeController(initialObjs...)
+
+	require.NoError(t, err)
+
+	fakeIndexerAdd(t, c, initialObjs...)
+
+	c.resync()
+
+	assert.Equal(t, 2, c.pvcQueue.Len())
 }
 
 func newFakeController(initialObjects ...runtime.Object) (*Controller, error) {

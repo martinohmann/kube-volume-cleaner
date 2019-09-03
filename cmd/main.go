@@ -67,7 +67,7 @@ func Run(options *config.Options) error {
 		return errors.Wrapf(err, "initializing kubernetes client failed")
 	}
 
-	klog.Infof("running with options: %#v", options)
+	klog.Infof("running with options: %+v", options)
 
 	controller, err := controller.New(client, options)
 	if err != nil {
@@ -78,9 +78,7 @@ func Run(options *config.Options) error {
 
 	go handleSignals(cancel)
 
-	controller.Run(ctx.Done())
-
-	return nil
+	return controller.Run(ctx.Done())
 }
 
 func handleSignals(cancelFunc func()) {

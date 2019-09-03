@@ -167,7 +167,7 @@ func (c *Controller) enqueue(queue workqueue.Interface, obj interface{}, kind st
 }
 
 // Run starts the controller and will block until stopCh is closed.
-func (c *Controller) Run(stopCh <-chan struct{}) {
+func (c *Controller) Run(stopCh <-chan struct{}) error {
 	defer utilruntime.HandleCrash()
 
 	defer c.podQueue.ShutDown()
@@ -182,8 +182,7 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 
 	// Wait for all involved caches to be synced, before processing items from the queue is started
 	if !cache.WaitForCacheSync(stopCh, c.podInformer.HasSynced, c.pvcInformer.HasSynced, c.setInformer.HasSynced) {
-		utilruntime.HandleError(errors.Errorf("timed out waiting for caches to sync"))
-		return
+		return errors.Errorf("timed out waiting for caches to sync")
 	}
 
 	go wait.Until(c.resync, c.resyncInterval, stopCh)
@@ -191,8 +190,12 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 	go wait.Until(worker(c.pvcQueue, c.syncVolumeClaim, "pvc"), time.Second, stopCh)
 	go wait.Until(worker(c.setQueue, c.syncStatefulSet, "statefulset"), time.Second, stopCh)
 
+	klog.Info("watching for changes")
+
 	<-stopCh
 	klog.Info("stopping controller")
+
+	return nil
 }
 
 // worker returns a function that can be used as a worker to consume queue and
@@ -630,10 +633,7 @@ func (c *Controller) handleStatefulSetDeletion(namespace, name string) error {
 	klog.V(4).Infof("statefulset %s/%s deleted", namespace, name)
 
 	pvcs, err := c.getVolumeClaimsForStatefulSet(namespace, name)
-	if apierrors.IsNotFound(err) {
-		klog.V(4).Infof("statefulset %s/%s does not have any pvcs", namespace, name)
-		return nil
-	} else if err != nil {
+	if err != nil {
 		return err
 	}
 

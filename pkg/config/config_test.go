@@ -15,12 +15,13 @@ func TestOptions_Validate(t *testing.T) {
 		expectedError string
 	}{
 		{
-			name:    "defaults",
+			name:    "defaults are always valid",
 			options: NewDefaultOptions(),
 		},
 		{
 			name: "negative DeleteAfter value",
 			options: &Options{
+				ControllerID:   DefaultControllerID,
 				ResyncInterval: DefaultResyncInterval,
 				DeleteAfter:    -1 * time.Second,
 			},
@@ -29,9 +30,17 @@ func TestOptions_Validate(t *testing.T) {
 		{
 			name: "invalid ResyncInterval value",
 			options: &Options{
+				ControllerID:   DefaultControllerID,
 				ResyncInterval: 999 * time.Millisecond,
 			},
 			expectedError: "--resync-interval has to be greater than or equal to 1s",
+		},
+		{
+			name: "empty controller id",
+			options: &Options{
+				ResyncInterval: DefaultResyncInterval,
+			},
+			expectedError: "--controller-id must not be empty",
 		},
 	}
 

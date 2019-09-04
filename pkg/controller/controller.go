@@ -37,6 +37,12 @@ const (
 	// run with a delete-after value > 0s.
 	DeleteAfterAnnotation = "pvc.kube-volume-cleaner.io/delete-after"
 
+	// ControllerAnnotation signals the ownership of a PersistentVolumeClaim to
+	// other kube-volume-cleaner instances. Controllers must not touch
+	// PersistentVolumeClaims where the value of this annotation does not match
+	// their own ID.
+	ControllerAnnotation = "kube-volume-cleaner.io/controller-id"
+
 	// maxSyncAttempts is the number of attempts to make to sync a given object
 	// key before giving up.
 	maxSyncAttempts = 5
@@ -48,6 +54,7 @@ const (
 type Controller struct {
 	client kubernetes.Interface
 
+	controllerID   string
 	labelSelector  labels.Selector
 	namespace      string
 	noDelete       bool
@@ -87,6 +94,7 @@ func New(client kubernetes.Interface, options *config.Options) (*Controller, err
 
 	c := &Controller{
 		client:         client,
+		controllerID:   options.ControllerID,
 		labelSelector:  labelSelector,
 		namespace:      options.Namespace,
 		noDelete:       options.NoDelete,
@@ -334,6 +342,12 @@ func (c *Controller) handleVolumeClaimUpdate(pvc *corev1.PersistentVolumeClaim) 
 		return nil
 	}
 
+	controllerID, exists := pvc.Annotations[ControllerAnnotation]
+	if exists && controllerID != c.controllerID {
+		klog.V(5).Infof("pvc managed by controller %q, ignoring", controllerID)
+		return nil
+	}
+
 	pod, err := c.getPodForVolumeClaim(pvc)
 	if err != nil {
 		klog.V(1).Infof("error while getting pod for pvc %s/%s", pvc.Namespace, pvc.Name)
@@ -360,6 +374,15 @@ func (c *Controller) handleVolumeClaimUpdate(pvc *corev1.PersistentVolumeClaim) 
 
 	klog.V(5).Infof("pvc %s/%s is not mounted to a pod", pvc.Namespace, pvc.Name)
 
+	return c.attemptVolumeClaimDeletion(pvc)
+}
+
+// attemptVolumeClaimDeletion performs checks to determine whether the pvc
+// should be deleted or not. Depending on the configured delete-after interval,
+// it will either delete the pvc right away or schedule it for deletion if all
+// preconditions are met. If any of the preconditions is not met, no deletion
+// attempt will be made.
+func (c *Controller) attemptVolumeClaimDeletion(pvc *corev1.PersistentVolumeClaim) error {
 	setName, exists := pvc.Annotations[StatefulSetAnnotation]
 	if !exists {
 		klog.V(5).Infof("pvc %s/%s does not have annotation %s, no candidate for deletion", pvc.Namespace, pvc.Name, StatefulSetAnnotation)
@@ -381,7 +404,6 @@ func (c *Controller) handleVolumeClaimUpdate(pvc *corev1.PersistentVolumeClaim) 
 	}
 
 	deleteAfter := c.getDeleteAfter(pvc)
-
 	now := time.Now()
 
 	if deleteAfter.After(now) {
@@ -490,7 +512,7 @@ func (c *Controller) syncVolumeClaimAnnotations(pvc *corev1.PersistentVolumeClai
 func (c *Controller) removeVolumeClaimAnnotations(pvc *corev1.PersistentVolumeClaim) error {
 	pvcCopy := pvc.DeepCopy()
 
-	objChanged := removeVolumeClaimAnnotations(pvcCopy, StatefulSetAnnotation, DeleteAfterAnnotation)
+	objChanged := removeVolumeClaimAnnotations(pvcCopy, ControllerAnnotation, StatefulSetAnnotation, DeleteAfterAnnotation)
 	if !objChanged {
 		return nil
 	}
@@ -506,10 +528,12 @@ func (c *Controller) removeVolumeClaimAnnotations(pvc *corev1.PersistentVolumeCl
 func (c *Controller) updateStatefulSetAnnotation(pvc *corev1.PersistentVolumeClaim, newValue string) error {
 	pvcCopy := pvc.DeepCopy()
 
-	removed := removeVolumeClaimAnnotations(pvcCopy, DeleteAfterAnnotation)
+	deleteAfterRemoved := removeVolumeClaimAnnotations(pvcCopy, DeleteAfterAnnotation)
 
-	updated := updateVolumeClaimAnnotation(pvcCopy, StatefulSetAnnotation, newValue)
-	if !removed && !updated {
+	controllerUpdated := updateVolumeClaimAnnotation(pvcCopy, ControllerAnnotation, c.controllerID)
+
+	setUpdated := updateVolumeClaimAnnotation(pvcCopy, StatefulSetAnnotation, newValue)
+	if !deleteAfterRemoved && !controllerUpdated && !setUpdated {
 		return nil
 	}
 

@@ -428,10 +428,13 @@ func TestSyncVolumeClaim(t *testing.T) {
 			},
 		},
 		{
-			name: "remove annotation if pod mounting pvc is not part of statefulset",
+			name: "remove annotations if pod mounting pvc is not part of statefulset",
 			key:  "default/foo",
 			initialObjs: []runtime.Object{
-				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+				newPVCWithAnnotations("foo", "default", map[string]string{
+					StatefulSetAnnotation: "the-set",
+					ControllerAnnotation:  config.DefaultControllerID,
+				}),
 				newPodWithVolumes("bar", "default", []corev1.Volume{
 					newVolumeWithClaim("vol", "foo"),
 				}),
@@ -441,6 +444,26 @@ func TestSyncVolumeClaim(t *testing.T) {
 				require.NoError(t, err)
 
 				assert.Len(t, pvc.Annotations, 0)
+			},
+		},
+		{
+			name: "do not remove annotations if pvc is managed by another controller",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithAnnotations("foo", "default", map[string]string{
+					StatefulSetAnnotation: "the-set",
+					ControllerAnnotation:  "the-other-controller",
+				}),
+				newPodWithVolumes("bar", "default", []corev1.Volume{
+					newVolumeWithClaim("vol", "foo"),
+				}),
+			},
+			validate: func(t *testing.T, c *Controller) {
+				pvc, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+
+				assert.Len(t, pvc.Annotations, 2)
+				assert.Equal(t, "the-other-controller", pvc.Annotations[ControllerAnnotation])
 			},
 		},
 		{
@@ -481,6 +504,7 @@ func TestSyncVolumeClaim(t *testing.T) {
 				require.NoError(t, err)
 
 				assert.Equal(t, "baz", pvc.Annotations[StatefulSetAnnotation])
+				assert.Equal(t, config.DefaultControllerID, pvc.Annotations[ControllerAnnotation])
 			},
 		},
 		{
@@ -514,7 +538,10 @@ func TestSyncVolumeClaim(t *testing.T) {
 			name: "do not update annotation if statefulset for pvc stays the same",
 			key:  "default/foo",
 			initialObjs: []runtime.Object{
-				newPVCWithStatefulSetAnnotation("foo", "default", "the-set"),
+				newPVCWithAnnotations("foo", "default", map[string]string{
+					StatefulSetAnnotation: "the-set",
+					ControllerAnnotation:  config.DefaultControllerID,
+				}),
 				newPodWithVolumesAndOwnerRefs(
 					"bar",
 					"default",
@@ -890,6 +917,20 @@ func TestSyncVolumeClaim(t *testing.T) {
 				})
 			},
 		},
+		{
+			name: "do not delete pvc if it is owned by another controller",
+			key:  "default/foo",
+			initialObjs: []runtime.Object{
+				newPVCWithAnnotations("foo", "default", map[string]string{
+					StatefulSetAnnotation: "the-set",
+					ControllerAnnotation:  "foo",
+				}),
+			},
+			validate: func(t *testing.T, c *Controller) {
+				_, err := c.client.CoreV1().PersistentVolumeClaims("default").Get("foo", metav1.GetOptions{})
+				require.NoError(t, err)
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -943,7 +984,7 @@ func newFakeController(initialObjects ...runtime.Object) (*Controller, error) {
 func newFakeControllerWithLabelSelectorAndNamespace(selector, namespace string, initialObjects ...runtime.Object) (*Controller, error) {
 	client := fake.NewSimpleClientset(initialObjects...)
 
-	return New(client, &config.Options{LabelSelector: selector, Namespace: namespace})
+	return New(client, &config.Options{LabelSelector: selector, Namespace: namespace, ControllerID: config.DefaultControllerID})
 }
 
 func newPod(name, namespace string) *corev1.Pod {
@@ -994,11 +1035,17 @@ func newPVC(name, namespace string) *corev1.PersistentVolumeClaim {
 }
 
 func newPVCWithStatefulSetAnnotation(name, namespace, statefulSetName string) *corev1.PersistentVolumeClaim {
-	pvc := newPVC(name, namespace)
-
-	pvc.Annotations = map[string]string{
+	annotations := map[string]string{
 		StatefulSetAnnotation: statefulSetName,
 	}
+
+	return newPVCWithAnnotations(name, namespace, annotations)
+}
+
+func newPVCWithAnnotations(name, namespace string, annotations map[string]string) *corev1.PersistentVolumeClaim {
+	pvc := newPVC(name, namespace)
+
+	pvc.Annotations = annotations
 
 	return pvc
 }

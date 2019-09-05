@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/util/workqueue"
 )
 
 func fakeIndexerAdd(t *testing.T, c *Controller, objs ...runtime.Object) {
@@ -975,6 +978,77 @@ func TestResync(t *testing.T) {
 	c.resync()
 
 	assert.Equal(t, 2, c.pvcQueue.Len())
+}
+
+type testSync struct {
+	sync.Mutex
+	numSeen map[string]int
+}
+
+func (s *testSync) syncFunc(key string) error {
+	s.Lock()
+	defer s.Unlock()
+
+	s.numSeen[key]++
+
+	if key == "invalid" {
+		return errors.New(key)
+	}
+
+	return nil
+}
+
+type fakeRateLimiter struct {
+	sync.Mutex
+	numRequeues map[interface{}]int
+}
+
+func (l *fakeRateLimiter) When(item interface{}) time.Duration {
+	l.Lock()
+	defer l.Unlock()
+	l.numRequeues[item]++
+	return 0
+}
+
+func (l *fakeRateLimiter) NumRequeues(item interface{}) int {
+	l.Lock()
+	defer l.Unlock()
+	return l.numRequeues[item]
+}
+
+func (l *fakeRateLimiter) Forget(item interface{}) {
+	l.Lock()
+	defer l.Unlock()
+	delete(l.numRequeues, item)
+}
+
+func TestWorker(t *testing.T) {
+	s := &testSync{numSeen: make(map[string]int)}
+	limiter := &fakeRateLimiter{numRequeues: make(map[interface{}]int)}
+	queue := workqueue.NewRateLimitingQueue(limiter)
+
+	w := worker(queue, s.syncFunc, "foo-kind")
+
+	queue.Add("invalid")
+	queue.Add("foo")
+
+	done := make(chan struct{}, 1)
+
+	go func() {
+		w()
+		done <- struct{}{}
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	queue.ShutDown()
+
+	select {
+	case <-done:
+		assert.Equal(t, 1, s.numSeen["foo"])
+		assert.Equal(t, 6, s.numSeen["invalid"])
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not finish in time")
+	}
 }
 
 func newFakeController(initialObjects ...runtime.Object) (*Controller, error) {

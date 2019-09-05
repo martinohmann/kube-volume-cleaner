@@ -12,6 +12,16 @@ const (
 	// resync PersistentVolumeClaims.
 	DefaultResyncInterval = 30 * time.Second
 
+	// DefaultDeleteAfter is the default time after which
+	// PersistentVolumeClaims are deleted where their managing StatefulSet was
+	// deleted.
+	DefaultDeleteAfter = 24 * time.Hour
+
+	// DefaultLabelSelector is the default label selector that is used to
+	// identify StatefulSets whose PersistentVolumeClaims should be managed by
+	// kube-volume-cleaner.
+	DefaultLabelSelector = "kube-volume-cleaner.io/on-delete=cleanup-pvcs"
+
 	// DefaultControllerID is the default ID of the controller used to annotate
 	// PersistentVolumeClaims with in order to allow multiple controllers to
 	// coexist without interfering.
@@ -32,6 +42,8 @@ type Options struct {
 func NewDefaultOptions() *Options {
 	return &Options{
 		ControllerID:   DefaultControllerID,
+		LabelSelector:  DefaultLabelSelector,
+		DeleteAfter:    DefaultDeleteAfter,
 		ResyncInterval: DefaultResyncInterval,
 	}
 }

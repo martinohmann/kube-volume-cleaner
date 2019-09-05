@@ -1,7 +1,7 @@
 ---
 project_name: kube-volume-cleaner
 builds:
-  - main: ./cmd/main.go
+  - main: ./main.go
     binary: kube-volume-cleaner
     ldflags:
       - -s -w
@@ -20,6 +20,15 @@ archives:
     replacements:
       386: i386
       amd64: x86_64
+dockers:
+  - goos: linux
+    goarch: amd64
+    image_templates:
+      - "mohmann/kube-volume-cleaner:latest"
+      - "mohmann/kube-volume-cleaner:{{ .Tag }}"
+      - "mohmann/kube-volume-cleaner:v{{ .Major }}"
+    binaries:
+      - kube-volume-cleaner
 release:
   github:
     owner: martinohmann

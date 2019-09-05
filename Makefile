@@ -1,6 +1,7 @@
 .DEFAULT_GOAL := help
 
 PKG_NAME := github.com/martinohmann/kube-volume-cleaner
+CGO_ENABLED := 0
 
 .PHONY: help
 help:

@@ -4,6 +4,7 @@ PKG_NAME := github.com/martinohmann/kube-volume-cleaner
 CGO_ENABLED := 0
 
 TEST_FLAGS ?= -race
+PKGS ?= $(shell go list ./... | grep -v /vendor/)
 
 .PHONY: help
 help:
@@ -26,15 +27,15 @@ install: build ## install kube-volume-cleaner
 
 .PHONY: test
 test: ## run tests
-	go test $(TEST_FLAGS) $$(go list ./... | grep -v /vendor/)
+	go test $(TEST_FLAGS) $(PKGS)
 
 .PHONY: vet
 vet: ## run go vet
-	go vet $$(go list ./... | grep -v /vendor/)
+	go vet $(PKGS)
 
 .PHONY: coverage
 coverage: ## generate code coverage
-	go test $(TEST_FLAGS) -covermode=atomic -coverprofile=coverage.txt $$(go list ./... | grep -v /vendor/)
+	go test $(TEST_FLAGS) -covermode=atomic -coverprofile=coverage.txt $(PKGS)
 	go tool cover -func=coverage.txt
 
 .PHONY: misspell
@@ -43,4 +44,4 @@ misspell: ## check spelling in go files
 
 .PHONY: lint
 lint: ## lint go files
-	golint ./...
+	golint $(PKGS)

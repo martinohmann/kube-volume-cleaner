@@ -3,6 +3,8 @@
 PKG_NAME := github.com/martinohmann/kube-volume-cleaner
 CGO_ENABLED := 0
 
+TEST_FLAGS ?= -race
+
 .PHONY: help
 help:
 	@grep -E '^[a-zA-Z-]+:.*?## .*$$' Makefile | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "[32m%-12s[0m %s\n", $$1, $$2}'
@@ -24,7 +26,7 @@ install: build ## install kube-volume-cleaner
 
 .PHONY: test
 test: ## run tests
-	go test -race -tags="$(TAGS)" $$(go list ./... | grep -v /vendor/)
+	go test $(TEST_FLAGS) $$(go list ./... | grep -v /vendor/)
 
 .PHONY: vet
 vet: ## run go vet
@@ -32,7 +34,8 @@ vet: ## run go vet
 
 .PHONY: coverage
 coverage: ## generate code coverage
-	scripts/coverage
+	go test $(TEST_FLAGS) -covermode=atomic -coverprofile=coverage.txt $$(go list ./... | grep -v /vendor/)
+	go tool cover -func=coverage.txt
 
 .PHONY: misspell
 misspell: ## check spelling in go files
